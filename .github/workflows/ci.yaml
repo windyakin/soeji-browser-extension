@@ -43,8 +43,8 @@ jobs:
         if: github.event_name == 'pull_request'
         id: web-ext-lint
         run: |
-          npx web-ext lint --output json > lint-result.json 2>&1 || true
-          cat lint-result.json
+          npx web-ext lint --output json > /tmp/lint-result.json 2>&1 || true
+          cat /tmp/lint-result.json
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'
@@ -52,7 +52,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const result = JSON.parse(fs.readFileSync('lint-result.json', 'utf8'));
+            const result = JSON.parse(fs.readFileSync('/tmp/lint-result.json', 'utf8'));
             const { summary, errors, warnings, notices } = result;
 
             const hasIssues = summary.errors > 0 || summary.warnings > 0;
