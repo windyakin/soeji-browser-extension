@@ -135,24 +135,18 @@ class SoejiUploader {
   startHistoryObserver() {
     // Watch for changes in the history container to shift indices when new items are added
     const checkAndObserve = () => {
-      const historyContainer = document.getElementById('historyContainer');
-      if (!historyContainer) {
+      const container = this._findHistoryItemContainer();
+      if (!container) {
         // Retry after a short delay if container not found yet
         setTimeout(checkAndObserve, 500);
         return;
       }
 
-      const container = historyContainer.querySelector('.sc-5d63727e-2');
-      if (!container) {
-        setTimeout(checkAndObserve, 500);
-        return;
-      }
-
       // Store current item count
-      let previousItemCount = container.querySelectorAll('.sc-5d63727e-28').length;
+      let previousItemCount = container.children.length;
 
       this.historyObserver = new MutationObserver(() => {
-        const currentItemCount = container.querySelectorAll('.sc-5d63727e-28').length;
+        const currentItemCount = container.children.length;
 
         if (currentItemCount > previousItemCount) {
           // New items were added at the top (index 0)
@@ -274,9 +268,10 @@ class SoejiUploader {
 
     // Create upload button matching NAI's button style
     const button = document.createElement('button');
-    // Use NAI's button classes for consistent styling
-    // Icon is rendered via CSS ::before pseudo-element (no innerHTML needed)
-    button.className = 'sc-2f2fb315-2 sc-2b71468b-1 kKotZl bzOrRh soeji-upload-btn';
+    // Copy classes from an existing NAI button in the container for consistent styling
+    // This avoids hardcoding sc-* class hashes that change with NAI updates
+    const existingBtn = container.querySelector('[data-projection-id] > button');
+    button.className = existingBtn ? existingBtn.className + ' soeji-upload-btn' : 'soeji-upload-btn';
     button.title = 'Upload to Soeji';
     button.onclick = (e) => {
       e.preventDefault();
@@ -322,7 +317,7 @@ class SoejiUploader {
     }
 
     // Insert before the seed button (the last button without data-projection-id wrapper)
-    // Structure: div.sc-2b71468b-0 > [div[data-projection-id] x 3] > button (seed)
+    // Structure: div > [div[data-projection-id] x N] > button (seed)
     const seedButton = container.querySelector(':scope > button');
     if (seedButton) {
       container.insertBefore(wrapper, seedButton);
@@ -334,13 +329,16 @@ class SoejiUploader {
   findButtonContainer(imgElement) {
     // NAI DOM structure (inside .display-grid-bottom):
     // <div style="display: flex; flex-direction: row; gap: 10px;">
-    //   <div class="sc-2b71468b-0">  <-- This is the button container we want
-    //     <div data-projection-id="9" style="height: 100%;"><button>...</button></div>
-    //     <div data-projection-id="10" style="height: 100%;"><button>...</button></div>
-    //     <div data-projection-id="11" style="height: 100%;"><button>...</button></div>
+    //   <div>  <-- This is the button container we want
+    //     <div data-projection-id="..." style="height: 100%;"><button>...</button></div>
+    //     <div data-projection-id="..." style="height: 100%;"><button>...</button></div>
+    //     <div data-projection-id="..." style="height: 100%;"><button>...</button></div>
     //     <button>Seed button (with span[style*="visibility"])</button>
     //   </div>
     // </div>
+    //
+    // Identified by: child div containing [data-projection-id] wrappers + seed button
+    // (no sc-* class dependency)
 
     let current = imgElement.parentElement;
     let attempts = 0;
@@ -353,13 +351,14 @@ class SoejiUploader {
         // Find the container with flex-direction: row that has data-projection-id buttons
         const rowContainer = displayGridBottom.querySelector('div[style*="flex-direction: row"]');
         if (rowContainer) {
-          // Find the div that contains both data-projection-id divs and a seed button
-          const buttonContainer = rowContainer.querySelector('div[class*="sc-2b71468b-0"]');
-          if (buttonContainer) {
-            // Verify it has the seed button (span with visibility style)
-            const seedSpan = buttonContainer.querySelector('button span[style*="visibility"]');
+          // Find the child div that contains data-projection-id wrappers AND a seed button
+          for (const child of rowContainer.children) {
+            if (child.tagName !== 'DIV') continue;
+            if (!child.querySelector('[data-projection-id]')) continue;
+            // Verify it has the seed button (direct child button with span[style*="visibility"])
+            const seedSpan = child.querySelector(':scope > button span[style*="visibility"]');
             if (seedSpan) {
-              return buttonContainer;
+              return child;
             }
           }
         }
@@ -380,15 +379,25 @@ class SoejiUploader {
     return parent.querySelector('img.image-grid-streaming-image') !== null;
   }
 
-  getHistoryItems() {
-    // Get all history items from the container
-    const historyContainer = document.getElementById('historyContainer');
-    if (!historyContainer) return [];
+  // Find the history items container within #historyContainer.
+  // History items have role="button" aria-label="choose image" - find the first one
+  // and return its parent (the items container). No sc-* class dependency.
+  _findHistoryItemContainer() {
+    const root = document.getElementById('historyContainer');
+    if (!root) return null;
 
-    const container = historyContainer.querySelector('.sc-5d63727e-2');
+    const firstItem = root.querySelector('[role="button"][aria-label="choose image"]');
+    if (!firstItem) return null;
+
+    return firstItem.parentElement;
+  }
+
+  getHistoryItems() {
+    // Get all history items from the container (no sc-* class dependency)
+    const container = this._findHistoryItemContainer();
     if (!container) return [];
 
-    return Array.from(container.querySelectorAll('.sc-5d63727e-28'));
+    return Array.from(container.children);
   }
 
   getSelectedHistoryIndex() {
