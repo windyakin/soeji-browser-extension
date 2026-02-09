@@ -145,17 +145,15 @@
   position: absolute;
   bottom: 4px;
   right: 4px;
-  min-width: 16px;
+  width: 16px;
   height: 16px;
   border-radius: 8px;
-  font-size: 11px;
-  font-weight: bold;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: white;
-  line-height: 1;
-  padding: 0 4px;
+  background-size: 10px 10px;
+  background-position: center;
+  background-repeat: no-repeat;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   z-index: 10;
   pointer-events: none;
@@ -165,7 +163,7 @@
   display: none;
 }
 
-/* History badge states - same as button badge */
+/* History badge states */
 .soeji-history-badge-uploading {
   background-color: #3b82f6;
   animation: soeji-pulse 1s infinite;
@@ -173,14 +171,17 @@
 
 .soeji-history-badge-success {
   background-color: #22c55e;
+  background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMCAxMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBvbHlsaW5lIHBvaW50cz0iMiA1LjUgNC41IDggOC41IDIuNSIvPjwvc3ZnPg==');
 }
 
 .soeji-history-badge-duplicate {
   background-color: #eab308;
+  background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMCAxMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBvbHlsaW5lIHBvaW50cz0iMiA1LjUgNC41IDggOC41IDIuNSIvPjwvc3ZnPg==');
 }
 
 .soeji-history-badge-error {
   background-color: #ef4444;
+  background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMCAxMCIgZmlsbD0id2hpdGUiPjxyZWN0IHg9IjQuMjUiIHk9IjEuNSIgd2lkdGg9IjEuNSIgaGVpZ2h0PSI0LjUiIHJ4PSIwLjc1Ii8+PGNpcmNsZSBjeD0iNSIgY3k9IjgiIHI9IjAuOSIvPjwvc3ZnPg==');
 }
 
 /* Spinner inside history badge */
