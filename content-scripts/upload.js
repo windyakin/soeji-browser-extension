@@ -186,7 +186,7 @@ class SoejiUploader {
 
   shiftHistoryIndices(count) {
     // Shift all indices in history Map by count (new items added at top)
-    for (const [blobUrl, data] of this.history) {
+    for (const [, data] of this.history) {
       data.index += count;
     }
   }

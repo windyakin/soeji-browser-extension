@@ -8,9 +8,14 @@
     "dev:firefox": "web-ext run --target firefox-desktop",
     "dev:chrome": "web-ext run --target chromium",
     "build": "web-ext build",
-    "lint": "web-ext lint"
+    "lint": "web-ext lint && eslint .",
+    "lint:eslint": "eslint .",
+    "lint:web-ext": "web-ext lint"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.0",
+    "globals": "^17.3.0",
     "web-ext": "^8.0.0"
   }
 }

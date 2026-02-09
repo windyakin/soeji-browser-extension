@@ -79,7 +79,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       showStatus('Settings saved!', 'success');
       setTimeout(hideStatus, 2000);
-    } catch (error) {
+    } catch (_error) {
       showStatus('Failed to save settings', 'error');
     }
   });
@@ -104,7 +104,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       updateApiKeyFieldState('');
       showStatus('API Key cleared', 'success');
       setTimeout(hideStatus, 2000);
-    } catch (error) {
+    } catch (_error) {
       showStatus('Failed to clear API Key', 'error');
     }
   });
@@ -151,7 +151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else {
         showStatus(`Server error: ${response.status}`, 'error');
       }
-    } catch (error) {
+    } catch (_error) {
       showStatus('Could not connect to server', 'error');
     } finally {
       testBtn.disabled = false;

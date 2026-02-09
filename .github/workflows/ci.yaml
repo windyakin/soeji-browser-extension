@@ -11,6 +11,20 @@ permissions:
   pull-requests: write
 
 jobs:
+  eslint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx eslint .
+
   web-ext:
     runs-on: ubuntu-latest
     steps:
@@ -29,8 +43,8 @@ jobs:
         if: github.event_name == 'pull_request'
         id: web-ext-lint
         run: |
-          npx web-ext lint --source-dir=dist --output json > lint-result.json 2>&1 || true
-          cat lint-result.json
+          npx web-ext lint --output json > /tmp/lint-result.json 2>&1 || true
+          cat /tmp/lint-result.json
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'
@@ -38,7 +52,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const result = JSON.parse(fs.readFileSync('lint-result.json', 'utf8'));
+            const result = JSON.parse(fs.readFileSync('/tmp/lint-result.json', 'utf8'));
             const { summary, errors, warnings, notices } = result;
 
             const hasIssues = summary.errors > 0 || summary.warnings > 0;
@@ -93,5 +107,5 @@ jobs:
               body
             });
 
-      - name: Check lint result
-        run: npx web-ext lint --source-dir=dist
+      - name: Check web-ext lint result
+        run: npx web-ext lint
