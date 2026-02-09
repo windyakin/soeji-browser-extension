@@ -29,7 +29,7 @@ jobs:
 
       - run: npm run build
 
-      - name: Create Release
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.zip --generate-notes
+      - name: Upload assets to Release
+        run: gh release upload "${GITHUB_REF_NAME}" dist/*.zip --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
