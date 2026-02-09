@@ -11,6 +11,20 @@ permissions:
   pull-requests: write
 
 jobs:
+  eslint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx eslint .
+
   web-ext:
     runs-on: ubuntu-latest
     steps:
@@ -93,5 +107,5 @@ jobs:
               body
             });
 
-      - name: Check lint result
+      - name: Check web-ext lint result
         run: npx web-ext lint
