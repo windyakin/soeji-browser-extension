@@ -596,13 +596,10 @@ class SoejiUploader {
       badge.appendChild(spinner);
     } else if (state === 'success') {
       badge.classList.add('soeji-history-badge-success');
-      badge.textContent = '✓';
     } else if (state === 'duplicate') {
       badge.classList.add('soeji-history-badge-duplicate');
-      badge.textContent = '✓';
     } else if (state === 'error') {
       badge.classList.add('soeji-history-badge-error');
-      badge.textContent = '!';
     } else {
       badge.classList.add('soeji-history-badge-hidden');
     }
