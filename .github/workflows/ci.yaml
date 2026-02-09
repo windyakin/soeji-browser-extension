@@ -29,7 +29,7 @@ jobs:
         if: github.event_name == 'pull_request'
         id: web-ext-lint
         run: |
-          npx web-ext lint --source-dir=dist --output json > lint-result.json 2>&1 || true
+          npx web-ext lint --output json > lint-result.json 2>&1 || true
           cat lint-result.json
 
       - name: Comment on PR
@@ -94,4 +94,4 @@ jobs:
             });
 
       - name: Check lint result
-        run: npx web-ext lint --source-dir=dist
+        run: npx web-ext lint
