@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  web-ext:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Run web-ext lint
+        if: github.event_name == 'pull_request'
+        id: web-ext-lint
+        run: |
+          npx web-ext lint --source-dir=dist --output json > lint-result.json 2>&1 || true
+          cat lint-result.json
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('lint-result.json', 'utf8'));
+            const { summary, errors, warnings, notices } = result;
+
+            const hasIssues = summary.errors > 0 || summary.warnings > 0;
+            const statusEmoji = hasIssues ? '⚠️' : '✅';
+
+            let body = `### ${statusEmoji} web-ext lint result\n\n`;
+            body += `| ❌ Errors | ⚠️ Warnings | ℹ️ Notices |\n|:---:|:---:|:---:|\n`;
+            body += `| ${summary.errors} | ${summary.warnings} | ${summary.notices} |\n\n`;
+
+            const formatIssues = (issues, type, emoji) => {
+              if (issues.length === 0) return '';
+              let md = `#### ${emoji} ${type}\n\n`;
+              for (const issue of issues) {
+                md += `- **${issue.code}**: ${issue.message}\n`;
+                md += `  - 📄 \`${issue.file}\` (line ${issue.line})\n`;
+                md += `  - ${issue.description}\n`;
+              }
+              return md + '\n';
+            };
+
+            body += formatIssues(errors, 'Errors', '❌');
+            body += formatIssues(warnings, 'Warnings', '⚠️');
+            body += formatIssues(notices, 'Notices', 'ℹ️');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComments = comments.filter(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('web-ext lint result')
+            );
+
+            // Minimize old comments as outdated
+            for (const comment of botComments) {
+              await github.graphql(`
+                mutation($id: ID!) {
+                  minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) {
+                    clientMutationId
+                  }
+                }
+              `, { id: comment.node_id });
+            }
+
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Check lint result
+        run: npx web-ext lint --source-dir=dist
