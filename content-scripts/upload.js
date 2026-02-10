@@ -15,11 +15,11 @@ class SoejiUploader {
     // Store button reference for badge updates
     this.currentButton = null;
     // History item tracking - Map-based centralized management
-    // Key: blob URL, Value: { status, index }
+    // Key: bgHash (djb2 hash of background-image dataURI), Value: { status, index }
     // - status: 'pending'|'uploading'|'success'|'duplicate'|'error'|'hidden'
     // - index: DOM index (0 = newest/top)
     this.history = new Map();
-    this.historyBadgeTimeouts = new Map(); // blob URL -> timeout ID (for auto-hide)
+    this.historyBadgeTimeouts = new Map(); // bgHash -> timeout ID (for auto-hide)
     this.historyObserver = null; // MutationObserver for history container (for index shift)
     this.init();
   }
@@ -187,56 +187,49 @@ class SoejiUploader {
 
   handleHistoryDeletion() {
     // Handle deletion of history items by comparing bgHash
+    // DOM items have their background-image shifted, so search backward from current index
     const historyItems = this.getHistoryItems();
-    const maxIndex = historyItems.length - 1;
 
-    for (const [blobUrl, data] of this.history) {
-      // If index exceeds DOM length, clamp to last element
-      const checkIndex = Math.min(data.index, maxIndex);
-      const domElement = historyItems[checkIndex];
-
-      if (!domElement) {
+    for (const [bgHash, data] of this.history) {
+      if (historyItems.length === 0) {
         // No DOM elements at all - delete this entry
-        console.log('[Soeji] History item deleted (no DOM element):', blobUrl);
-        this.history.delete(blobUrl);
-        const timeout = this.historyBadgeTimeouts.get(blobUrl);
+        console.log('[Soeji] History item deleted (no DOM element):', bgHash);
+        this.history.delete(bgHash);
+        const timeout = this.historyBadgeTimeouts.get(bgHash);
         if (timeout) {
           clearTimeout(timeout);
-          this.historyBadgeTimeouts.delete(blobUrl);
+          this.historyBadgeTimeouts.delete(bgHash);
         }
         continue;
       }
 
-      const currentBgHash = this.getBackgroundImageHash(domElement);
+      // Start from current index (clamped to valid range) and search backward
+      const startIndex = Math.min(data.index, historyItems.length - 1);
+      let found = false;
 
-      if (currentBgHash === data.bgHash) {
-        // Match found - update index if it was clamped
-        if (checkIndex !== data.index) {
-          console.log('[Soeji] Index adjusted for:', blobUrl, 'from', data.index, 'to', checkIndex);
-          data.index = checkIndex;
-        }
-      } else {
-        // bgHash mismatch - try shifting index down by 1
-        const shiftedIndex = data.index - 1;
-        if (shiftedIndex >= 0) {
-          const shiftedElement = historyItems[shiftedIndex];
-          const shiftedBgHash = shiftedElement ? this.getBackgroundImageHash(shiftedElement) : null;
+      for (let i = startIndex; i >= 0; i--) {
+        const element = historyItems[i];
+        if (!element) continue;
 
-          if (shiftedBgHash === data.bgHash) {
-            // Found at shifted position
-            console.log('[Soeji] Index shifted for:', blobUrl, 'from', data.index, 'to', shiftedIndex);
-            data.index = shiftedIndex;
-            continue;
+        const elementHash = this.getBackgroundImageHash(element);
+        if (elementHash === bgHash) {
+          if (i !== data.index) {
+            console.log('[Soeji] Index adjusted for:', bgHash, 'from', data.index, 'to', i);
+            data.index = i;
           }
+          found = true;
+          break;
         }
+      }
 
-        // Not found - this entry was deleted
-        console.log('[Soeji] History item deleted (bgHash mismatch):', blobUrl);
-        this.history.delete(blobUrl);
-        const timeout = this.historyBadgeTimeouts.get(blobUrl);
+      if (!found) {
+        // Item was not found in any position - remove from tracking
+        console.log('[Soeji] History item deleted (not found):', bgHash);
+        this.history.delete(bgHash);
+        const timeout = this.historyBadgeTimeouts.get(bgHash);
         if (timeout) {
           clearTimeout(timeout);
-          this.historyBadgeTimeouts.delete(blobUrl);
+          this.historyBadgeTimeouts.delete(bgHash);
         }
       }
     }
@@ -449,10 +442,18 @@ class SoejiUploader {
       button.classList.remove('soeji-disabled');
       button.title = 'Upload to Soeji';
 
-      // Update uploaded state (check if in history map)
-      const src = imgElement.src;
-      if (this.history.has(src)) {
-        button.classList.add('soeji-uploaded');
+      // Update uploaded state (check if in history map by bgHash)
+      const selectedIndex = this.getSelectedHistoryIndex();
+      if (selectedIndex >= 0) {
+        const historyItems = this.getHistoryItems();
+        const bgHash = historyItems[selectedIndex]
+          ? this.getBackgroundImageHash(historyItems[selectedIndex])
+          : null;
+        if (bgHash && this.history.has(bgHash)) {
+          button.classList.add('soeji-uploaded');
+        } else {
+          button.classList.remove('soeji-uploaded');
+        }
       } else {
         button.classList.remove('soeji-uploaded');
       }
@@ -526,8 +527,8 @@ class SoejiUploader {
 
     // Build a reverse lookup: index -> data
     const indexToData = new Map();
-    for (const [blobUrl, data] of this.history) {
-      indexToData.set(data.index, { blobUrl, ...data });
+    for (const [bgHash, data] of this.history) {
+      indexToData.set(data.index, { bgHash, ...data });
     }
 
     // Clear all existing badges, set data-history-key, and manage delete button state
@@ -540,8 +541,7 @@ class SoejiUploader {
 
       // Set data-history-key for debugging
       if (data) {
-        const keyId = data.blobUrl.split('/').pop() || data.blobUrl;
-        item.setAttribute('data-history-key', keyId);
+        item.setAttribute('data-history-key', data.bgHash);
 
         // Disable delete button while uploading/pending
         if (deleteBtn) {
@@ -608,21 +608,20 @@ class SoejiUploader {
   }
 
   // Update history item status and sync badges
-  updateHistoryStatus(blobUrl, status, index = null, bgHash = null) {
-    // Clear any existing timeout for this blob
-    const existingTimeout = this.historyBadgeTimeouts.get(blobUrl);
+  updateHistoryStatus(bgHash, status, index = null) {
+    // Clear any existing timeout for this bgHash
+    const existingTimeout = this.historyBadgeTimeouts.get(bgHash);
     if (existingTimeout) {
       clearTimeout(existingTimeout);
-      this.historyBadgeTimeouts.delete(blobUrl);
+      this.historyBadgeTimeouts.delete(bgHash);
     }
 
-    // Get existing entry to preserve index and bgHash if not provided
-    const existing = this.history.get(blobUrl);
+    // Get existing entry to preserve index if not provided
+    const existing = this.history.get(bgHash);
     const finalIndex = index !== null ? index : (existing ? existing.index : 0);
-    const finalBgHash = bgHash !== null ? bgHash : (existing ? existing.bgHash : null);
 
-    // Update status in history Map (preserve index and bgHash)
-    this.history.set(blobUrl, { status, index: finalIndex, bgHash: finalBgHash });
+    // Update status in history Map
+    this.history.set(bgHash, { status, index: finalIndex });
 
     // Sync badges
     this.syncHistoryBadges();
@@ -630,14 +629,14 @@ class SoejiUploader {
     // Set auto-hide timeout for success/duplicate
     if (status === 'success' || status === 'duplicate') {
       const timeout = setTimeout(() => {
-        const current = this.history.get(blobUrl);
+        const current = this.history.get(bgHash);
         if (current) {
-          this.history.set(blobUrl, { status: 'hidden', index: current.index, bgHash: current.bgHash });
+          this.history.set(bgHash, { status: 'hidden', index: current.index });
         }
-        this.historyBadgeTimeouts.delete(blobUrl);
+        this.historyBadgeTimeouts.delete(bgHash);
         this.syncHistoryBadges();
       }, 3000);
-      this.historyBadgeTimeouts.set(blobUrl, timeout);
+      this.historyBadgeTimeouts.set(bgHash, timeout);
     }
   }
 
@@ -676,13 +675,6 @@ class SoejiUploader {
 
     const blobUrl = imgElement.src;
 
-    // Check if this image is already in the queue (uploading or pending)
-    const isInQueue = this.uploadQueue.some(item => item.blobUrl === blobUrl);
-    if (isInQueue) {
-      console.log('[Soeji] Image already in queue:', blobUrl);
-      return;
-    }
-
     // Get the currently selected history item index and its background-image hash
     const historyIndex = this.getSelectedHistoryIndex();
     const historyItems = this.getHistoryItems();
@@ -691,14 +683,26 @@ class SoejiUploader {
       : null;
     console.log('[Soeji] Selected history index:', historyIndex, 'bgHash:', bgHash);
 
-    // Add to history map with pending status, index, and bgHash, update button opacity
-    this.updateHistoryStatus(blobUrl, 'pending', historyIndex, bgHash);
+    // Check if this image is already in the queue (uploading or pending) by bgHash
+    if (bgHash) {
+      const isInQueue = this.uploadQueue.some(item => item.bgHash === bgHash);
+      if (isInQueue) {
+        console.log('[Soeji] Image already in queue (bgHash):', bgHash);
+        return;
+      }
+    }
+
+    // Add to history map with pending status and index, update button opacity
+    if (bgHash) {
+      this.updateHistoryStatus(bgHash, 'pending', historyIndex);
+    }
     this.updateButtonOpacity(button, imgElement);
 
-    // Create queue item (no historyIndex - use blobUrl to reference history)
+    // Create queue item with bgHash for history tracking
     const queueItem = {
       id: crypto.randomUUID(),
       blobUrl: blobUrl,
+      bgHash: bgHash,
       status: 'pending'
     };
 
@@ -732,7 +736,9 @@ class SoejiUploader {
 
   async executeUpload(item) {
     // Update history status to uploading
-    this.updateHistoryStatus(item.blobUrl, 'uploading');
+    if (item.bgHash) {
+      this.updateHistoryStatus(item.bgHash, 'uploading');
+    }
 
     try {
       // Extract image blob from blob URL
@@ -745,27 +751,31 @@ class SoejiUploader {
         if (result.duplicate) {
           item.status = 'duplicate';
           console.log('[Soeji] Duplicate:', item.id);
-          // Update history status to duplicate
-          this.updateHistoryStatus(item.blobUrl, 'duplicate');
+          if (item.bgHash) {
+            this.updateHistoryStatus(item.bgHash, 'duplicate');
+          }
         } else {
           item.status = 'success';
           console.log('[Soeji] Success:', item.id);
-          // Update history status to success
-          this.updateHistoryStatus(item.blobUrl, 'success');
+          if (item.bgHash) {
+            this.updateHistoryStatus(item.bgHash, 'success');
+          }
         }
       } else {
         item.status = 'error';
         this.currentBatchHasError = true;
-        // Update history status to error (keep badge visible for retry)
-        this.updateHistoryStatus(item.blobUrl, 'error');
+        if (item.bgHash) {
+          this.updateHistoryStatus(item.bgHash, 'error');
+        }
         console.log('[Soeji] Error:', item.id, result.error);
       }
     } catch (error) {
       console.error('[Soeji] Upload error:', error);
       item.status = 'error';
       this.currentBatchHasError = true;
-      // Update history status to error (keep badge visible for retry)
-      this.updateHistoryStatus(item.blobUrl, 'error');
+      if (item.bgHash) {
+        this.updateHistoryStatus(item.bgHash, 'error');
+      }
     }
 
     // Remove completed item from queue
