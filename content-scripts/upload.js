@@ -254,16 +254,14 @@ class SoejiUploader {
     }
 
     // Create a wrapper div to match NAI's structure
-    // NAI uses: <div class="sc-1f65f26d-0" data-projection-id="..." style="height: 100%;">
+    // NAI uses: <div class="sc-1f65f26d-0" style="height: 100%;">
     const wrapper = document.createElement('div');
     wrapper.style.height = '100%';
     wrapper.className = 'soeji-button-wrapper';
 
     // Create upload button matching NAI's button style
     const button = document.createElement('button');
-    // Copy classes from an existing NAI button in the container for consistent styling
-    // This avoids hardcoding sc-* class hashes that change with NAI updates
-    const existingBtn = container.querySelector('[data-projection-id] > button');
+    const existingBtn = container.querySelector('div[style*="height: 100%"] > button');
     button.className = existingBtn ? existingBtn.className + ' soeji-upload-btn' : 'soeji-upload-btn';
     button.title = 'Upload to Soeji';
     button.onclick = (e) => {
@@ -309,8 +307,8 @@ class SoejiUploader {
       siblingObserver.observe(parent, { childList: true });
     }
 
-    // Insert before the seed button (the last button without data-projection-id wrapper)
-    // Structure: div > [div[data-projection-id] x N] > button (seed)
+    // Insert before the seed button
+    // Structure: div > [div[style="height: 100%"] x N] > button (seed)
     const seedButton = container.querySelector(':scope > button');
     if (seedButton) {
       container.insertBefore(wrapper, seedButton);
@@ -323,32 +321,25 @@ class SoejiUploader {
     // NAI DOM structure (inside .display-grid-bottom):
     // <div style="display: flex; flex-direction: row; gap: 10px;">
     //   <div>  <-- This is the button container we want
-    //     <div data-projection-id="..." style="height: 100%;"><button>...</button></div>
-    //     <div data-projection-id="..." style="height: 100%;"><button>...</button></div>
-    //     <div data-projection-id="..." style="height: 100%;"><button>...</button></div>
+    //     <div style="height: 100%;"><button>...</button></div>
+    //     <div style="height: 100%;"><button>...</button></div>
+    //     <div style="height: 100%;"><button>...</button></div>
     //     <button>Seed button (with span[style*="visibility"])</button>
     //   </div>
     // </div>
-    //
-    // Identified by: child div containing [data-projection-id] wrappers + seed button
-    // (no sc-* class dependency)
 
     let current = imgElement.parentElement;
     let attempts = 0;
     const maxAttempts = 25;
 
     while (current && attempts < maxAttempts) {
-      // Look for .display-grid-bottom which contains the button area
       const displayGridBottom = current.querySelector('.display-grid-bottom');
       if (displayGridBottom) {
-        // Find the container with flex-direction: row that has data-projection-id buttons
         const rowContainer = displayGridBottom.querySelector('div[style*="flex-direction: row"]');
         if (rowContainer) {
-          // Find the child div that contains data-projection-id wrappers AND a seed button
           for (const child of rowContainer.children) {
             if (child.tagName !== 'DIV') continue;
-            if (!child.querySelector('[data-projection-id]')) continue;
-            // Verify it has the seed button (direct child button with span[style*="visibility"])
+            if (!child.querySelector('div[style*="height: 100%"] > button')) continue;
             const seedSpan = child.querySelector(':scope > button span[style*="visibility"]');
             if (seedSpan) {
               return child;
