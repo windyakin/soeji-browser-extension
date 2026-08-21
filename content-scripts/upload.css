@@ -12,6 +12,11 @@
   position: relative;
 }
 
+/* NAI's dimmed button variant sets opacity: 0.5 - never let it dim our enabled button */
+.soeji-upload-btn:not(.soeji-disabled) {
+  opacity: 1;
+}
+
 /* Icon using CSS mask-image (avoiding innerHTML for SVG, color controlled by background-color) */
 .soeji-upload-btn::before {
   content: '';
