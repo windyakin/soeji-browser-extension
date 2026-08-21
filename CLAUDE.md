@@ -16,7 +16,7 @@ browser-extension/
 │   ├── popup.js            # 設定ポップアップロジック
 │   └── popup.css           # ポップアップスタイル
 └── docs/
-    ├── nai-history-dom-behavior.md  # NAI履歴アイテムのDOM挙動詳細
+    ├── nai-history-dom-behavior.md  # NAIのDOM構造・挙動（ビューアバー / キャンバスタイル / 履歴）
     └── history-tracking.md          # history Mapによるアップロード状態管理
 ```
 
@@ -31,43 +31,47 @@ browser-extension/
 
 ### Content Script (`content-scripts/upload.js`)
 
-NovelAIの画像グリッドにアップロードボタンを注入するスクリプト。
+NovelAIのビューアバー（画像下のボタン列）にアップロードボタンを注入するスクリプト。
 
 #### 主要クラス: `SoejiUploader`
 
 | プロパティ | 型 | 説明 |
 |-----------|-----|------|
-| `uploadQueue` | Array | アップロード待機キュー（`{id, blobUrl, bgHash, status}`） |
-| `history` | Map | 画像状態の一元管理（bgHash → `{status, index}`）。indexはDOM位置（0=最新） |
+| `uploadQueue` | Array | アップロード待機キュー（`{id, blobUrl, historyKey, status}`） |
+| `history` | Map | 画像状態の一元管理（historyKey → `{status}`）。historyKey は履歴アイテムの `data-group-id` |
 | `currentBatchHasError` | boolean | 現在のバッチでエラーが発生したか |
 | `resultBadgeTimeout` | number | 結果バッジ非表示タイマーID |
-| `currentButton` | Element | バッジ更新用のボタン参照 |
-| `historyBadgeTimeouts` | Map | bgHash → タイムアウトID（完了バッジ自動非表示用） |
-| `historyObserver` | MutationObserver | 履歴コンテナ監視（新規アイテム検出時にインデックスシフト） |
+| `currentButton` | Element | ビューアバーに注入した唯一のアップロードボタン |
+| `historyBadgeTimeouts` | Map | historyKey → タイムアウトID（完了バッジ自動非表示用） |
+| `observer` | MutationObserver | body 監視（`childList` + `class`/`src` 属性。ボタン再注入・状態更新） |
+| `stateInterval` | number | 2秒ごとの `updateButtonState()` セーフティネット |
+| `historyObserver` | MutationObserver | `#historyContainer` 監視（追加/削除/選択変更でバッジ同期） |
 
 #### アップロードフロー
 
-1. `injectButton()`: `.image-grid-image`要素を検出し、アップロードボタンを注入
-   - 画像srcの変更を`MutationObserver`で監視し、アイコンの半透明状態を更新
-2. `handleUpload()`: ボタンクリック時にキューに追加
-   - 同じbgHashがキュー内にある場合は追加しない（連打防止）
+1. `injectButton()`: `.display-grid-bottom`（ビューアバー、ページに1つ）の可視領域からピン/コピー/保存ボタンのグループを探し、アップロードボタンを1つ注入
+   - バーは表示中の全画像で共有されるため、ボタンは画像に紐付かない
+2. `handleUpload()`: ボタンクリック時に**その時点で選択中のタイル**（`.image-gen-save-bar` を持たない `.image-gen-canvas-tile`）の `img.image-grid-image` を解決してキューに追加
+   - 同じ historyKey がキュー内にある場合は追加しない（連打防止）
    - 既にアップロード済みの画像でも再アップロード可能
    - `history` Mapにstatusを追加し、`syncHistoryBadges()`でバッジを同期
 3. `processQueue()`: キューから1件ずつアップロードを開始
 4. `executeUpload()`: blob URLから画像を取得し、バックエンドにPOST
 5. `showResultStatus()`: キュー完了時に結果バッジを表示
 6. `updateBadges()`: キュー状態に応じてバッジを更新
+7. `updateButtonState()`: 選択中タイル/履歴アイテムに応じて無効化（生成中・未選択）と半透明（アップロード済み）を更新
 
 ### UI要素
 
 #### アップロードボタン (`.soeji-upload-btn`)
 
-- NAIの既存ボタンと並んで表示
-- アイコン: インラインSVG（アップロード矢印）
-- アップロード済み/中の画像ではアイコン（SVG）のみ `opacity: 0.4`（半透明）
+- ビューアバー右側のピン/コピー/保存ボタンの隣に表示（ページに1つ）
+- 見た目は隣の NAI ボタンの sc-* クラスをコピーして合わせる。NAI は状態でクラスを差し替える（画像なし時は `opacity: 0.5` の薄い変種）ので、`updateButtonState()` のたびに `syncButtonClasses()` で現在のクラスへ同期し、CSS でも `.soeji-upload-btn:not(.soeji-disabled) { opacity: 1 }` で保険をかける
+- アイコン: CSS `mask-image` によるアップロード矢印（`::before`）
+- アップロード済み/中の画像ではアイコン（`::before`）のみ `opacity: 0.4`（半透明）
   - `.soeji-uploaded` クラスで制御
   - バッジは半透明にならない
-- `disabled`にはしない（いつでも押せる）
+- 生成中（`img.image-grid-image-incoming` あり）または選択中タイルが無いときのみ `disabled`（`.soeji-disabled`）
 - 既にアップロード済みの画像でも再アップロード可能（何かあったときの救済措置）
 
 #### アップロード進捗バッジ (`.soeji-badge`、右上)
@@ -124,9 +128,10 @@ npm run lint         # web-ext lint
 
 ## CSS実装ルール
 
-1. **SVGアイコン**: `innerHTML`でインラインSVGを挿入（アップロードアイコン）
+1. **アップロードアイコン**: `.soeji-upload-btn::before` に data URI の SVG を `mask-image` として指定（色は `background-color` で制御、`innerHTML` は使わない）
 2. **スピナー**: `.soeji-spinner` クラスを持つ `<span>` 要素を `appendChild` で追加
-3. **アイコン半透明**: `.soeji-uploaded` クラスをボタンに付与し、`.soeji-upload-btn.soeji-uploaded svg` で `opacity: 0.4` を指定
+3. **アイコン半透明**: `.soeji-uploaded` クラスをボタンに付与し、`.soeji-upload-btn.soeji-uploaded::before` で `opacity: 0.4` を指定
+4. **ボタン無効化**: `.soeji-disabled` クラスで `opacity: 0.4` + `pointer-events: none`
 
 ## バックエンドとの連携
 
@@ -156,11 +161,17 @@ Content-Type: multipart/form-data
 
 - `duplicate: true` の場合も成功として扱う（エラーにはしない）
 
-## 履歴アイテムとの紐付け
+## NAI の DOM 構造との紐付け
 
 > 詳細は以下のドキュメントを参照:
-> - [docs/nai-history-dom-behavior.md](docs/nai-history-dom-behavior.md) — NAI 履歴アイテムの DOM 挙動
+> - [docs/nai-history-dom-behavior.md](docs/nai-history-dom-behavior.md) — NAI の DOM 構造・挙動（ビューアバー / キャンバスタイル / 履歴）
 > - [docs/history-tracking.md](docs/history-tracking.md) — history Map によるアップロード状態管理
+
+要点:
+- sc-* クラスには依存しない。`.display-grid-bottom` / `.image-gen-canvas-tile` / `.image-gen-save-bar` / `img.image-grid-image` / `#historyContainer` / `[aria-label]` / `data-group-id` を使う
+- ビューアバー内には `visibility: hidden` の計測用コピーがあるので、可視要素のみを対象にする
+- 履歴の選択状態は `boxShadow !== 'none'` で判定（`borderColor` は使えない）
+- 履歴アイテムは先頭に prepend され、`data-group-id` はノードに固定（index のシフト処理は不要）
 
 ## Firefox Add-ons 対応
 

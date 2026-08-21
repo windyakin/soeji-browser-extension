@@ -1,138 +1,107 @@
-# NovelAI 履歴アイテムのDOM挙動
+# NovelAI の DOM 挙動
 
-NovelAI の履歴コンテナ (`#historyContainer`) における DOM 操作は特殊な挙動をするため、拡張機能のインデックス管理において注意が必要。
+NovelAI 画像生成ページ（https://novelai.net/image）のうち、拡張機能が依存している DOM 構造と挙動のまとめ。
+sc-* クラス名はビルド毎に変わるため使用せず、安定したクラス名・属性・computed style で要素を特定する。
 
-## DOM構造
+> 2026-08 の NAI アップデートで構造が大きく変わった。以前の「1枚表示＋画像ごとのボタンバー」「履歴は末尾追加＋background-image シフト」という挙動は**もう存在しない**。
+
+## 全体構造
 
 ```
+.image-gen-output-region
+├─ .image-gen-canvas
+│   └─ div（パン可能なキャンバス）
+│       ├─ svg ×N（装飾、aria-hidden）
+│       ├─ .image-gen-canvas-tile [style: left/top/width/height]   ← 画像タイル（新しいものほど上）
+│       │   └─ div
+│       │       ├─ img.image-grid-image                            ← 表示画像（blob URL）
+│       │       ├─ div > .image-gen-save-bar（非選択タイルのみ）     ← ホバー用ボタン群
+│       │       └─ div > シードボタン（非選択タイルのみ）
+│       └─ .image-gen-canvas-tile ...
+└─ .display-grid-bottom                                            ← ビューアバー（ページに1つ、全タイル共通）
+    └─ div > .image-gen-viewer-bar
+        ├─ div（計測用コピー: visibility:hidden / 0x0）            ← 無視すること
+        └─ div（可視バー）
+            ├─ div（左: サイズ表示・設定・シードボタン）
+            └─ div[style*="margin-left: auto"]（右）
+                └─ ... > div                                       ← アップロードボタン注入先
+                    ├─ div[style="height: 100%"] > button（ピン留め）
+                    ├─ div[style="height: 100%"] > button（コピー）
+                    └─ div[style="height: 100%"] > button（保存）
+
 #historyContainer
-  ├─ div（ヘッダー: 「履歴」ラベル、ヘルプアイコン、設定ボタン）
-  ├─ div（履歴アイテムコンテナ ← _findHistoryItemContainer() で取得）
-  │   ├─ div[role="button"][aria-label="choose image"]（履歴アイテム[0]、最新）
-  │   │   └─ button[aria-label="delete image(s)"]（削除ボタン）
-  │   ├─ div[role="button"][aria-label="choose image"]（履歴アイテム[1]）
-  │   │   └─ button[aria-label="delete image(s)"]
-  │   ├─ div[role="button"][aria-label="choose image"]（履歴アイテム[2]）
-  │   │   └─ button[aria-label="delete image(s)"]
-  │   └─ ...
-  └─ div（フッター: 「一括で圧縮保存」ボタン、「Clear History」ボタン）
+├─ div（ヘッダー）
+├─ div > div（履歴アイテムコンテナ）
+│   ├─ div[role="button"][aria-label="choose image"][data-group-id="<UUID>"]   ← 履歴アイテム[0]（最新）
+│   │   └─ button[aria-label="delete image(s)"]
+│   ├─ div[role="button"][aria-label="choose image"][data-group-id="<UUID>"]   ← 履歴アイテム[1]
+│   └─ ...
+└─ div（フッター）
 ```
 
-### セレクタの抽象化
+## ビューアバー（`.display-grid-bottom`）
 
-sc-* クラス名はビルド毎に変わるため使用しない。実装では以下のセレクタで要素を特定する:
+| 項目 | 内容 |
+|------|------|
+| 個数 | ページに **1つだけ**。表示中の全タイルで共有され、**選択中の画像**の情報（シード値等）を表示する |
+| 計測用コピー | `.image-gen-viewer-bar` の第1子はレイアウト計測用の複製で `visibility: hidden`。`querySelector` で先にヒットするため、**`getComputedStyle(el).visibility !== 'hidden'` で除外必須** |
+| ボタン注入先 | 可視要素のうち、直下に `div[style*="height: 100%"] > button` を **2個以上**持つ div（ピン/コピー/保存のグループ）。末尾に `appendChild` すると保存ボタンの右に並ぶ |
+| 再描画 | 生成・選択変更ではバーは再構築されない（注入したボタンは残る）。念のため body の MutationObserver で消えていたら再注入する |
+| ボタンのクラス | NAI のボタンは状態で styled-components のクラスが差し替わる。画像なし（初回生成開始直後など）は薄い変種（`opacity: 0.5`）、画像ありは通常変種。注入時にコピーしたクラスは自動では変わらないので、定期的に隣のボタンのクラスへ同期する |
+
+## キャンバスタイル（`.image-gen-canvas-tile`）
+
+| 項目 | 内容 |
+|------|------|
+| 仮想化 | 履歴の全画像分は描画されず、**選択中の画像とその近傍（2〜3個）**のみ。DOM 順や個数から履歴 index を推定することは**できない** |
+| 配置 | `style.top` = 履歴 index × ピッチ（画像高さ＋余白）。画像サイズが異なると崩れるので依存しない |
+| 選択中タイル | **`.image-gen-save-bar` を持たない唯一のタイル**。非選択タイルにはホバー用オーバーレイ（`.image-gen-save-bar` にピン/コピー/保存ボタン、別 div にシードボタン）が常に存在する |
+| 画像 | `img.image-grid-image`（`src` は blob URL）。同じ画像の img 要素は選択変更で差し替わらない |
+| 生成中 | タイル内に `div.image-grid-thumbnail-standin` と `img.image-grid-image-incoming` が現れ、完了すると `img.image-grid-image` に置き換わる。（旧 `img.image-grid-streaming-image` は廃止）<br>ページ読み込み後の**初回生成**では、ビューアバーのボタン群とタイルが先に現れ（この時点で img は無い）、その後 `img.image-grid-image-incoming` ↔ `img.image-grid-image` が class/src の差し替えで切り替わる。ノードの増減を伴わないので、**MutationObserver は `childList` だけでなく `attributes`（class/src）も監視する**必要がある |
+| 選択操作 | 履歴アイテムのクリックでキャンバスがそのタイルへパンし、バーの内容が切り替わる。ホイールによるパンでは選択は変わらない |
+| 識別子 | タイル DOM には group id に相当する属性は**ない**（React の key にのみ `"<groupId>.<variation>"` が入る） |
+
+## 履歴アイテム（`#historyContainer`）
 
 | 対象 | セレクタ / 取得方法 |
 |------|-------------------|
 | ルート | `#historyContainer` |
-| アイテムコンテナ | `[role="button"][aria-label="choose image"]` で最初のアイテムを見つけ `.parentElement` |
-| 全アイテム | `container.children`（Array.from で配列化） |
-| 削除ボタン | `button[aria-label="delete image(s)"]` |
-| 選択中アイテム | `borderColor` の computed style が非透明（`transparent` / `rgba(0,0,0,0)` 以外） |
-| アイテム同一性 | `background-image` の computed style を djb2 ハッシュ化 |
+| 全アイテム | `#historyContainer [role="button"][aria-label="choose image"]`（DOM 順 = 表示順、0 が最新） |
+| 識別子 | `data-group-id` 属性（UUID、ノードに固定で安定） |
+| 削除ボタン | アイテム内の `button[aria-label="delete image(s)"]` |
+| 選択中アイテム | computed style の **`boxShadow` が `none` 以外**（選択中: `rgba(245,243,194,.75) 0 0 0 2px, ...`）。`borderColor` は選択状態にかかわらず透明なので使えない |
+| サムネイル | `background-image` の data URI（`data-group-id` が無い場合の djb2 ハッシュによるフォールバック用） |
 
-## アイテム追加時の挙動
+### アイテム追加時の挙動
 
-### 概要
-
-新しい画像が生成されると、履歴アイテムが追加される。ただし、**DOM要素の追加は末尾**に行われ、**`background-image` の指定が1つずつ後ろにずれる**ことで、表示上は最新アイテムが先頭に見える。
-
-### 詳細
-
-1. 新しい DOM 要素がコンテナの**末尾**に `appendChild` される
-2. 既存の各 DOM 要素の `background-image` が**1つ後ろのDOM要素**にずれる
-3. 先頭の DOM 要素（index 0）に新しい画像の `background-image` が設定される
-4. 結果として、DOM の並び順は変わらないまま、表示内容だけがシフトする
-
-### 例
+新しい画像が生成されると、新しい DOM 要素がコンテナの**先頭に prepend** される。既存ノードの `data-group-id` / `background-image` は変化しない。
 
 ```
-【追加前】DOM順:
-  [0] bg=画像A（最新）
-  [1] bg=画像B
-  [2] bg=画像C
-
-↓ 画像Dが生成される
-
-【追加後】DOM順:
-  [0] bg=画像D（最新）← background-image が差し替わる
-  [1] bg=画像A        ← 元の[0]の bg が移動
-  [2] bg=画像B        ← 元の[1]の bg が移動
-  [3] bg=画像C        ← 新規DOM要素（末尾に追加）、元の[2]の bg が移動
+【追加前】          【追加後】
+ [0] gid=A           [0] gid=D  ← 新規ノード（先頭に挿入）
+ [1] gid=B           [1] gid=A  ← 同じノード
+ [2] gid=C           [2] gid=B
+                     [3] gid=C
 ```
 
-### 拡張機能への影響
+→ index ではなく `data-group-id` で追跡すればシフト処理は不要。
 
-- `MutationObserver` で `childList` の変更を検出すると、DOM 要素数の増加として検知できる
-- しかし、追加された DOM 要素は末尾にあり、**中身（`background-image`）は既存要素からずれて移動している**
-- そのため、**全エントリの index を +1 シフト**する必要がある（`shiftHistoryIndices(count)`）
-- `getHistoryItems()` で取得した配列は DOM 順のまま使用可能（reverse 不要）
+### アイテム削除時の挙動
 
-## アイテムの同一性判定
+該当ノードが DOM から取り除かれるだけ。他のノードは変化しない。
 
-### `background-image` の dataURI によるハッシュ比較
+### 選択変更時の挙動
 
-- 各履歴アイテムの `background-image` には dataURI が指定されている
-- アイテムが同一かどうかは、この dataURI を比較することでのみ判定可能
-- dataURI は巨大なため、**そのまま保持せず djb2 ハッシュ化**して `bgHash` として管理する
+styled-components のクラスが差し替わる（box-shadow あり/なし）。`class` 属性の変更を MutationObserver で検出できる。
 
-```javascript
-getBackgroundImageHash(element) {
-  const style = window.getComputedStyle(element);
-  const bgImage = style.backgroundImage;
-  if (!bgImage || bgImage === 'none') return null;
-  return this.hashString(bgImage); // djb2 → 8桁hex
-}
-```
-
-## アイテム削除時の挙動
-
-### 概要
-
-履歴アイテムが削除されると、DOM 要素数が減少する。削除されたアイテムの位置によって、他のアイテムのインデックスがずれる可能性がある。
-
-### 検出と修正のアルゴリズム
-
-`handleHistoryDeletion()` で以下の手順を実行する:
-
-1. 各 history Map エントリについて、現在の `data.index` の DOM 要素の `bgHash` を確認
-2. 一致すれば、そのエントリの位置は正しい（変更なし）
-3. **不一致**の場合、`index - 1` の位置を確認
-4. それでも不一致なら `index - 2`、`index - 3`、... と**後方に向かってループで探索**
-5. どの位置でも見つからなければ、そのエントリ自体が削除されたと判断し、history Map から削除
-
-### 削除パターン別の動作
-
-```
-【初期状態】
-  [0] bg=D（bgHash=xxx） ← 追跡中
-  [1] bg=C
-  [2] bg=B（bgHash=yyy） ← 追跡中
-  [3] bg=A
-
-ケース1: [1]（画像C）が削除された場合
-  [0] bg=D  ← index 0、bgHash=xxx → 一致 ✓
-  [1] bg=B  ← 追跡中の画像B、元は index 2
-  [2] bg=A
-  → 画像Bの bgHash を index 2 で確認 → 不一致
-  → index 1 で確認 → 一致 ✓ → index を 1 に更新
-
-ケース2: [2]（画像B、追跡対象）自体が削除された場合
-  [0] bg=D  ← index 0、bgHash=xxx → 一致 ✓
-  [1] bg=C
-  [2] bg=A
-  → 画像Bの bgHash を index 2 で確認 → 不一致
-  → index 1 で確認 → 不一致
-  → index 0 で確認 → 不一致
-  → history Map から削除
-```
-
-## まとめ: 拡張機能が守るべきルール
+## 拡張機能が守るべきルール
 
 | 操作 | 対応 |
 |------|------|
-| アイテム追加検出 | `childList` 変更で DOM 要素数の増加を検知し、全エントリの index を `+count` シフト |
-| アイテム同一性判定 | `background-image` の dataURI を djb2 ハッシュ化した `bgHash` で比較 |
-| アイテム削除検出 | DOM 要素数の減少を検知し、`bgHash` で現在位置から後方探索して index を修正 |
-| 探索失敗時 | 該当エントリを history Map から削除（管理対象外にする） |
-| DOM 順序 | `Array.from(container.children)` がそのまま表示順（reverse 不要） |
+| ボタン注入 | `.display-grid-bottom` 内の可視バーから「`div[height:100%] > button` を2個以上持つ div」を探し、1回だけ注入 |
+| アップロード対象 | クリック時に「`.image-gen-save-bar` を持たないタイル」の `img.image-grid-image` を解決する（img を固定しない） |
+| 生成中判定 | `img.image-grid-image-incoming` / `.image-grid-thumbnail-standin` の有無 |
+| 履歴アイテムの同一性 | `data-group-id`（無ければ `background-image` の djb2 ハッシュ） |
+| 選択中履歴アイテム | `boxShadow !== 'none'` |
+| 履歴の監視 | `#historyContainer` を `childList`（subtree）＋ `attributes: ['class']` で監視。自分が入れたバッジの増減は無視する |
+| 全体の監視 | `document.body` を `childList`（subtree）＋ `attributes: ['class', 'src']` で監視し、ボタン再注入と状態更新を行う。自分のボタン/バッジ配下の変化は無視する |

@@ -2,111 +2,87 @@
 
 NAI の履歴アイテムとアップロード状態を紐付けて管理する仕組み。
 
-> NAI の履歴アイテムの DOM 挙動については [nai-history-dom-behavior.md](nai-history-dom-behavior.md) を参照。
+> NAI の DOM 挙動については [nai-history-dom-behavior.md](nai-history-dom-behavior.md) を参照。
 
 ## history Map
 
 画像のアップロード状態を `history` Map で一元管理する。
 
 ```javascript
-this.history = new Map(); // bgHash → { status, index }
+this.history = new Map(); // historyKey → { status }
 ```
 
-### キー: `bgHash`
+### キー: `historyKey`
 
-履歴アイテムの `background-image`（dataURI）を djb2 ハッシュ化した 8 桁 hex 文字列。
+履歴アイテムの `data-group-id` 属性（UUID）。NAI がアイテムごとに固定で付与するため、追加・削除・選択変更があっても変わらない。
 
-- NAI は履歴アイテムを選択するたびに新しい blob URL を生成するため、blob URL は識別子として使えない
-- `background-image` の dataURI は同一画像であれば不変のため、そのハッシュを安定した識別子として使用する
+- `data-group-id` が取れない場合のフォールバックとして、`background-image`（data URI）の djb2 ハッシュ（8桁 hex）を使う
+- blob URL は選択のたびに変わりうるので識別子には使わない
 
 ```javascript
-getBackgroundImageHash(element) {
-  const style = window.getComputedStyle(element);
-  const bgImage = style.backgroundImage;
-  if (!bgImage || bgImage === 'none') return null;
-  return this.hashString(bgImage); // djb2 → 8桁hex
+getHistoryKey(item) {
+  return item.getAttribute('data-group-id') || this.getBackgroundImageHash(item);
 }
 ```
 
-### 値: `{ status, index }`
+### 値: `{ status }`
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `status` | string | `'pending'`/`'uploading'`/`'success'`/`'duplicate'`/`'error'`/`'hidden'` |
-| `index` | number | DOM上の位置（0 = 最新/一番上） |
 
 ### 設計方針
 
-- **DOM参照なし**: DOM要素への参照は持たず、`index` でDOM位置を追跡する
-- **削除検出**: キー自体が `bgHash` のため、DOM要素の `background-image` と直接突合してインデックスを修正する
+- **DOM参照なし・index なし**: キーが DOM ノードに固定されているため、位置の追跡（シフト／後方探索）は不要
+- **削除されたアイテムのエントリは消さない**: 該当ノードが無ければバッジが付かないだけで害はない（セッション中の Map サイズはアップロード数程度）
+- **バッジは差分更新**: `syncHistoryBadges()` は現在のバッジ状態（`data-state`）と望ましい状態を比較し、変わったときだけ DOM を触る（MutationObserver のループ防止）
 
-## 半透明判定（`soeji-uploaded`）
+## アップロード対象の解決
 
-アップロード済みの画像を選択中のとき、アップロードボタンのアイコンを半透明にする。
+ビューアバー（アップロードボタンの置き場所）はページに1つしかなく、表示中の全タイルで共有される。そのため **ボタンクリック時点で**「選択中のタイル」を解決し、その `img.image-grid-image` の blob URL をアップロードする。
 
 ```
-1. getSelectedHistoryIndex() で選択中の履歴アイテムのインデックスを取得
-2. getBackgroundImageHash() でその履歴アイテムの bgHash を取得
-3. history.has(bgHash) で判定
+1. getSelectedTile(): .image-gen-canvas-tile のうち .image-gen-save-bar を持たないもの
+   - 候補が複数（生成中の一時状態）なら、生成中でなく画像が読み込まれているものを優先。それでも曖昧なら null
+2. getTileImage(tile): tile 内の img.image-grid-image
+3. getSelectedHistoryKey(): boxShadow が none でない履歴アイテムの data-group-id
 ```
 
-- 選択中の履歴アイテムがない場合（`index === -1`）は半透明にしない
-- `bgHash` が null の場合も半透明にしない
+## 半透明判定（`soeji-uploaded`）／無効化（`soeji-disabled`）
+
+`updateButtonState()` で一括更新する。body と `#historyContainer` の MutationObserver から呼ばれる。
+
+| 条件 | 状態 |
+|------|------|
+| 選択中タイルが無い / 画像が無い | `soeji-disabled`（title: No image selected） |
+| 生成中（`img.image-grid-image-incoming` あり） | `soeji-disabled`（title: Image is generating...） |
+| 選択中履歴アイテムの key が `history` にある | `soeji-uploaded`（アイコン半透明） |
 
 ## アップロードキュー
 
 ```javascript
-uploadQueue item: { id, blobUrl, bgHash, status }
+uploadQueue item: { id, blobUrl, historyKey, status }
 ```
 
 | フィールド | 説明 |
 |-----------|------|
 | `id` | `crypto.randomUUID()` による一意 ID |
 | `blobUrl` | 画像データ取得用の blob URL（フェッチに使用） |
-| `bgHash` | history Map のキー（状態管理に使用、null の場合あり） |
+| `historyKey` | history Map のキー（状態管理に使用、null の場合あり） |
 | `status` | `'pending'`/`'uploading'` |
 
-- キューの重複チェックは `bgHash` で行う（blob URL は毎回変わるため不可）
-- `bgHash` が null の場合（履歴に未反映の画像）は重複チェックをスキップし、history 追跡なしでアップロードのみ実行する
-
-## インデックス管理
-
-### 追加時のシフト
-
-新しい履歴アイテムが DOM に追加されると、既存アイテムのインデックスがずれる。`MutationObserver` で履歴コンテナの `childList` を監視し、要素数の増加を検出して全エントリの index をシフトする。
-
-```javascript
-shiftHistoryIndices(count) {
-  for (const [, data] of this.history) {
-    data.index += count;
-  }
-}
-```
-
-### 削除時の修正
-
-履歴アイテムが削除されると、`bgHash` を使って DOM 要素と突合しインデックスを修正する。
-
-```
-各エントリについて:
-1. data.index（DOM要素数以内にクランプ）の位置の bgHash を確認
-2. 一致すれば index を更新（クランプされた場合のみ）
-3. 不一致の場合、index - 1 → index - 2 → ... → 0 とループで後方探索
-4. どの位置でも一致しなければ、そのエントリ自体が削除されたと判断
-   → history Map から削除
-```
+- キューの重複チェックは `historyKey` で行う
+- `historyKey` が null の場合（履歴アイテムが特定できない）は重複チェックをスキップし、history 追跡なしでアップロードのみ実行する
 
 ## バッジ同期
 
-状態変更時に毎回 DOM を走査してバッジを同期する方式（`syncHistoryBadges()`）。
-
 ### フロー
 
-1. `updateHistoryStatus(bgHash, status, index)`: history Map の status/index を更新
-2. `syncHistoryBadges()`: history Map の内容を DOM に反映
-   - すべての既存バッジを削除
-   - history Map を走査し、`data.index` に対応する DOM 要素にバッジを作成
+1. `updateHistoryStatus(historyKey, status)`: history Map の status を更新
+2. `syncHistoryBadges()`: 全履歴アイテムを走査し、key に対応するエントリの状態をバッジに反映（差分のみ）
 3. 完了/重複の場合は 3 秒後に status を `'hidden'` に変更して再同期
+
+履歴 DOM の変化（追加・削除・選択変更）でも `syncHistoryBadges()` が呼ばれるため、NAI 側で再描画されてもバッジは復元される。
 
 ### 履歴アイテムバッジ (`.soeji-history-badge`)
 
@@ -132,12 +108,14 @@ shiftHistoryIndices(count) {
 
 | メソッド | 説明 |
 |---------|------|
+| `findButtonContainer()` | ビューアバー内のボタン注入先を取得 |
+| `getSelectedTile()` / `getTileImage(tile)` | 選択中タイルとその画像を取得 |
+| `isGenerating(tile)` | 生成中かどうか |
 | `getHistoryItems()` | 履歴アイテムの DOM 要素配列を取得（0 番目が最新） |
-| `getSelectedHistoryIndex()` | 現在選択中の履歴アイテムのインデックスを取得 |
-| `getBackgroundImageHash(element)` | 要素の `background-image` から djb2 ハッシュ値を取得 |
-| `updateHistoryStatus(bgHash, status, index)` | history Map の status/index を更新し同期 |
-| `syncHistoryBadges()` | history Map を DOM に同期（毎回全バッジを再作成、削除ボタン状態も管理） |
+| `getSelectedHistoryItem()` / `getSelectedHistoryKey()` | 選択中の履歴アイテム／その key を取得 |
+| `getHistoryKey(item)` | `data-group-id`（無ければ bgHash）を取得 |
+| `updateHistoryStatus(historyKey, status)` | history Map の status を更新し同期 |
+| `syncHistoryBadges()` | history Map を DOM に差分同期（削除ボタン状態も管理） |
 | `createHistoryBadge(element, state)` | 指定要素にバッジを作成 |
-| `shiftHistoryIndices(count)` | 全エントリの index を count 分シフト |
-| `handleHistoryDeletion()` | 削除検出時に bgHash で突合してインデックスを修正 |
-| `startHistoryObserver()` | 履歴コンテナの監視を開始（追加/削除検出用） |
+| `updateButtonState()` | アップロードボタンの有効/無効・半透明を更新 |
+| `startObserver()` / `startHistoryObserver()` | body／履歴コンテナの監視を開始 |

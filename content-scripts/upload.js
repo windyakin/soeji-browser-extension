@@ -3,24 +3,38 @@
 // Use browser API if available (Firefox), otherwise chrome (Chrome)
 const browserAPI = typeof browser !== 'undefined' ? browser : chrome;
 
+// NAI DOM selectors (no sc-* class dependency).
+// See docs/nai-history-dom-behavior.md for details.
+const SELECTORS = {
+  viewerBar: '.display-grid-bottom',
+  canvasTile: '.image-gen-canvas-tile',
+  tileImage: 'img.image-grid-image',
+  tileIncoming: 'img.image-grid-image-incoming, .image-grid-thumbnail-standin',
+  tileSaveBar: '.image-gen-save-bar',
+  historyRoot: '#historyContainer',
+  historyItem: '[role="button"][aria-label="choose image"]',
+  historyDeleteButton: 'button[aria-label="delete image(s)"]'
+};
+
 class SoejiUploader {
   constructor() {
-    this.observer = null;
+    this.observer = null; // MutationObserver on document.body (button injection / state refresh)
+    this.historyObserver = null; // MutationObserver on #historyContainer (badge sync / selection change)
     this.processTimeout = null;
+    this.historySyncTimeout = null;
+    this.stateInterval = null; // periodic safety-net refresh of the button state
     this.config = null;
     // Upload queue management
-    this.uploadQueue = [];
+    this.uploadQueue = []; // { id, blobUrl, historyKey, status }
     this.currentBatchHasError = false; // Track if any error occurred in current batch
     this.resultBadgeTimeout = null; // Timer ID for hiding result badge
-    // Store button reference for badge updates
+    // Store button reference for badge updates (single shared button in the viewer bar)
     this.currentButton = null;
     // History item tracking - Map-based centralized management
-    // Key: bgHash (djb2 hash of background-image dataURI), Value: { status, index }
+    // Key: historyKey (data-group-id of the history item, bgHash fallback), Value: { status }
     // - status: 'pending'|'uploading'|'success'|'duplicate'|'error'|'hidden'
-    // - index: DOM index (0 = newest/top)
     this.history = new Map();
-    this.historyBadgeTimeouts = new Map(); // bgHash -> timeout ID (for auto-hide)
-    this.historyObserver = null; // MutationObserver for history container (for index shift)
+    this.historyBadgeTimeouts = new Map(); // historyKey -> timeout ID (for auto-hide)
     this.init();
   }
 
@@ -43,15 +57,23 @@ class SoejiUploader {
     }
 
     console.log('[Soeji] Extension initialized');
+    this.start();
+  }
 
-    // Process existing images
-    this.processImages();
+  start() {
+    // Inject button into the viewer bar if it already exists
+    this.refresh();
 
-    // Watch for new images (NAI uses dynamic rendering)
+    // Watch for DOM changes (NAI uses dynamic rendering)
     this.startObserver();
 
-    // Watch for history container changes (for badge re-sync when new items added)
+    // Watch for history container changes (badge sync / selection change)
     this.startHistoryObserver();
+
+    // Safety net: NAI may change image state without a mutation we observe
+    if (!this.stateInterval) {
+      this.stateInterval = setInterval(() => this.updateButtonState(), 2000);
+    }
   }
 
   async loadConfig() {
@@ -88,8 +110,7 @@ class SoejiUploader {
     // If config was previously null and now has backendUrl, initialize
     if (this.config && this.config.backendUrl && !this.observer) {
       console.log('[Soeji] Configuration updated, starting observer');
-      this.processImages();
-      this.startObserver();
+      this.start();
     }
   }
 
@@ -104,157 +125,96 @@ class SoejiUploader {
     }
   }
 
-  processImages() {
-    const images = document.querySelectorAll('img.image-grid-image:not([data-soeji-processed])');
-    console.log('[Soeji] Found images:', images.length);
-    images.forEach((img) => this.injectButton(img));
+  // ---------------------------------------------------------------------------
+  // Observers
+  // ---------------------------------------------------------------------------
+
+  refresh() {
+    this.injectButton();
+    this.updateButtonState();
   }
 
   startObserver() {
     this.observer = new MutationObserver((mutations) => {
-      let hasNewNodes = false;
+      let relevant = false;
       for (const mutation of mutations) {
-        if (mutation.addedNodes.length > 0) {
-          hasNewNodes = true;
+        // Ignore mutations on our own elements (button / badges) to avoid feedback loops
+        const target = mutation.target;
+        if (target.nodeType === Node.ELEMENT_NODE && target.closest('.soeji-button-wrapper, .soeji-history-badge')) continue;
+        if (mutation.type === 'attributes' || mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0) {
+          relevant = true;
           break;
         }
       }
-      if (hasNewNodes) {
+      if (relevant) {
         // Debounce to avoid excessive processing
         clearTimeout(this.processTimeout);
-        this.processTimeout = setTimeout(() => this.processImages(), 100);
+        this.processTimeout = setTimeout(() => this.refresh(), 100);
       }
     });
 
+    // childList: viewer bar / tiles / images added or removed
+    // attributes(class, src): image state changes without node changes
+    //   (e.g. incoming -> finished is a class/src swap on the same <img>, which happens
+    //   on the first generation after page load)
     this.observer.observe(document.body, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'src']
     });
   }
 
   startHistoryObserver() {
-    // Watch for changes in the history container to shift indices when new items are added
-    const checkAndObserve = () => {
-      const container = this._findHistoryItemContainer();
-      if (!container) {
-        // Retry after a short delay if container not found yet
-        setTimeout(checkAndObserve, 500);
-        return;
-      }
-
-      // Store current item count
-      let previousItemCount = container.children.length;
-
-      this.historyObserver = new MutationObserver(() => {
-        const currentItemCount = container.children.length;
-
-        if (currentItemCount > previousItemCount) {
-          // New items were added at the top (index 0)
-          // Shift all existing indices by the number of new items
-          const addedCount = currentItemCount - previousItemCount;
-          this.shiftHistoryIndices(addedCount);
-          console.log('[Soeji] History items added:', addedCount, 'Shifted indices');
-          // Re-sync badges after addition
-          this.syncHistoryBadges();
-        } else if (currentItemCount < previousItemCount) {
-          // Items were deleted - handle index adjustment using bgHash comparison
-          console.log('[Soeji] History items deleted:', previousItemCount - currentItemCount);
-          this.handleHistoryDeletion();
-        } else {
-          // Count unchanged but content may have changed - just re-sync
-          this.syncHistoryBadges();
-        }
-
-        previousItemCount = currentItemCount;
-      });
-
-      this.historyObserver.observe(container, {
-        childList: true
-      });
-
-      console.log('[Soeji] History observer started');
-    };
-
-    checkAndObserve();
-  }
-
-  shiftHistoryIndices(count) {
-    // Shift all indices in history Map by count (new items added at top)
-    for (const [, data] of this.history) {
-      data.index += count;
-    }
-  }
-
-  handleHistoryDeletion() {
-    // Handle deletion of history items by comparing bgHash
-    // DOM items have their background-image shifted, so search backward from current index
-    const historyItems = this.getHistoryItems();
-
-    for (const [bgHash, data] of this.history) {
-      if (historyItems.length === 0) {
-        // No DOM elements at all - delete this entry
-        console.log('[Soeji] History item deleted (no DOM element):', bgHash);
-        this.history.delete(bgHash);
-        const timeout = this.historyBadgeTimeouts.get(bgHash);
-        if (timeout) {
-          clearTimeout(timeout);
-          this.historyBadgeTimeouts.delete(bgHash);
-        }
-        continue;
-      }
-
-      // Start from current index (clamped to valid range) and search backward
-      const startIndex = Math.min(data.index, historyItems.length - 1);
-      let found = false;
-
-      for (let i = startIndex; i >= 0; i--) {
-        const element = historyItems[i];
-        if (!element) continue;
-
-        const elementHash = this.getBackgroundImageHash(element);
-        if (elementHash === bgHash) {
-          if (i !== data.index) {
-            console.log('[Soeji] Index adjusted for:', bgHash, 'from', data.index, 'to', i);
-            data.index = i;
-          }
-          found = true;
-          break;
-        }
-      }
-
-      if (!found) {
-        // Item was not found in any position - remove from tracking
-        console.log('[Soeji] History item deleted (not found):', bgHash);
-        this.history.delete(bgHash);
-        const timeout = this.historyBadgeTimeouts.get(bgHash);
-        if (timeout) {
-          clearTimeout(timeout);
-          this.historyBadgeTimeouts.delete(bgHash);
-        }
-      }
-    }
-
-    this.syncHistoryBadges();
-  }
-
-  injectButton(imgElement) {
-    imgElement.setAttribute('data-soeji-processed', 'true');
-
-    // Find the button container by looking for sibling elements with buttons
-    const container = this.findButtonContainer(imgElement);
-    console.log('[Soeji] Found container:', container);
-    if (!container) {
-      console.log('[Soeji] Could not find button container for image');
+    const root = document.querySelector(SELECTORS.historyRoot);
+    if (!root) {
+      // Retry after a short delay if container not found yet
+      setTimeout(() => this.startHistoryObserver(), 500);
       return;
     }
 
-    // Check if already injected in this container
-    if (container.querySelector('.soeji-button-wrapper')) {
-      return;
-    }
+    this.historyObserver = new MutationObserver((mutations) => {
+      // Ignore mutations caused by our own badge insert/remove to avoid feedback loops
+      const relevant = mutations.some((mutation) => {
+        if (mutation.type === 'attributes') return true;
+        const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
+        return nodes.some((node) => !(node.nodeType === Node.ELEMENT_NODE && node.classList.contains('soeji-history-badge')));
+      });
+      if (!relevant) return;
 
-    // Create a wrapper div to match NAI's structure
-    // NAI uses: <div class="sc-1f65f26d-0" style="height: 100%;">
+      clearTimeout(this.historySyncTimeout);
+      this.historySyncTimeout = setTimeout(() => {
+        this.syncHistoryBadges();
+        this.updateButtonState();
+      }, 50);
+    });
+
+    // childList: items added (prepended) / removed
+    // attributes(class): selection change (styled-components swaps the class)
+    this.historyObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class']
+    });
+
+    console.log('[Soeji] History observer started');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Upload button injection (viewer bar)
+  // ---------------------------------------------------------------------------
+
+  injectButton() {
+    const container = this.findButtonContainer();
+    if (!container) return;
+
+    // Already injected in this container
+    if (container.querySelector('.soeji-button-wrapper')) return;
+
+    console.log('[Soeji] Injecting upload button');
+
+    // Create a wrapper div to match NAI's structure: <div style="height: 100%"><button>...</button></div>
     const wrapper = document.createElement('div');
     wrapper.style.height = '100%';
     wrapper.className = 'soeji-button-wrapper';
@@ -267,7 +227,7 @@ class SoejiUploader {
     button.onclick = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      this.handleUpload(imgElement, button);
+      this.handleUpload();
     };
 
     // Create progress badge (top-right)
@@ -281,127 +241,106 @@ class SoejiUploader {
     button.appendChild(queueBadge);
 
     wrapper.appendChild(button);
+    container.appendChild(wrapper);
 
-    // Store button reference for badge updates
+    // Store button reference for badge updates, restore badges (bar may have been re-rendered)
     this.currentButton = button;
-
-    // Set initial opacity based on whether image is already uploaded
-    this.updateButtonOpacity(button, imgElement);
-
-    // Watch for image src changes to update button state
-    const imgObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.attributeName === 'src') {
-          this.updateButtonState(button, imgElement);
-        }
-      }
-    });
-    imgObserver.observe(imgElement, { attributes: true, attributeFilter: ['src'] });
-
-    // Watch for streaming image sibling changes (generation start/complete)
-    const parent = imgElement.parentElement;
-    if (parent) {
-      const siblingObserver = new MutationObserver(() => {
-        this.updateButtonState(button, imgElement);
-      });
-      siblingObserver.observe(parent, { childList: true });
-    }
-
-    // Insert before the seed button
-    // Structure: div > [div[style="height: 100%"] x N] > button (seed)
-    const seedButton = container.querySelector(':scope > button');
-    if (seedButton) {
-      container.insertBefore(wrapper, seedButton);
-    } else {
-      container.appendChild(wrapper);
-    }
+    this.updateBadges();
+    this.updateButtonState();
   }
 
-  findButtonContainer(imgElement) {
-    // NAI DOM structure (inside .display-grid-bottom):
-    // <div style="display: flex; flex-direction: row; gap: 10px;">
-    //   <div>  <-- This is the button container we want
-    //     <div style="height: 100%;"><button>...</button></div>
-    //     <div style="height: 100%;"><button>...</button></div>
-    //     <div style="height: 100%;"><button>...</button></div>
-    //     <button>Seed button (with span[style*="visibility"])</button>
-    //   </div>
-    // </div>
+  findButtonContainer() {
+    // NAI DOM structure (inside .display-grid-bottom > ... > .image-gen-viewer-bar):
+    //   [0] measurement copy of the bar (visibility: hidden) - must be skipped
+    //   [1] visible bar
+    //        left : size / settings / seed button
+    //        right: <div>                                   <-- button container we want
+    //                 <div style="height: 100%;"><button>pin</button></div>
+    //                 <div style="height: 100%;"><button>copy</button></div>
+    //                 <div style="height: 100%;"><button>save</button></div>
+    //               </div>
+    // We look for a visible div that directly contains 2+ "div[height:100%] > button" children.
+    const bar = document.querySelector(SELECTORS.viewerBar);
+    if (!bar) return null;
 
-    let current = imgElement.parentElement;
-    let attempts = 0;
-    const maxAttempts = 25;
+    for (const div of bar.querySelectorAll('div')) {
+      if (window.getComputedStyle(div).visibility === 'hidden') continue;
 
-    while (current && attempts < maxAttempts) {
-      const displayGridBottom = current.querySelector('.display-grid-bottom');
-      if (displayGridBottom) {
-        const rowContainer = displayGridBottom.querySelector('div[style*="flex-direction: row"]');
-        if (rowContainer) {
-          for (const child of rowContainer.children) {
-            if (child.tagName !== 'DIV') continue;
-            if (!child.querySelector('div[style*="height: 100%"] > button')) continue;
-            const seedSpan = child.querySelector(':scope > button span[style*="visibility"]');
-            if (seedSpan) {
-              return child;
-            }
-          }
-        }
+      let buttonCount = 0;
+      for (const child of div.children) {
+        if (child.tagName !== 'DIV') continue;
+        const style = child.getAttribute('style') || '';
+        if (!style.includes('height: 100%')) continue;
+        if (!child.querySelector(':scope > button')) continue;
+        buttonCount++;
       }
-
-      current = current.parentElement;
-      attempts++;
+      if (buttonCount >= 2) return div;
     }
 
     return null;
   }
 
-  isStreamingImage(imgElement) {
-    // Check if .image-grid-streaming-image exists as a sibling element
-    // This indicates the image is still being generated
-    const parent = imgElement.parentElement;
-    if (!parent) return false;
-    return parent.querySelector('img.image-grid-streaming-image') !== null;
+  // ---------------------------------------------------------------------------
+  // Canvas tiles (displayed images)
+  // ---------------------------------------------------------------------------
+
+  getTiles() {
+    return Array.from(document.querySelectorAll(SELECTORS.canvasTile));
   }
 
-  // Find the history items container within #historyContainer.
-  // History items have role="button" aria-label="choose image" - find the first one
-  // and return its parent (the items container). No sc-* class dependency.
-  _findHistoryItemContainer() {
-    const root = document.getElementById('historyContainer');
-    if (!root) return null;
+  // The selected (current) tile is the only tile WITHOUT the hover save bar overlay.
+  // Non-selected tiles have .image-gen-save-bar (pin/copy/save) as an overlay.
+  getSelectedTile() {
+    const candidates = this.getTiles().filter((tile) => !tile.querySelector(SELECTORS.tileSaveBar));
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length === 0) return null;
 
-    const firstItem = root.querySelector('[role="button"][aria-label="choose image"]');
-    if (!firstItem) return null;
+    // Ambiguous (e.g. transient state during generation): prefer a tile with a finished image
+    const finished = candidates.filter((tile) => this.getTileImage(tile) && !this.isGenerating(tile));
+    if (finished.length === 1) return finished[0];
 
-    return firstItem.parentElement;
+    console.log('[Soeji] Ambiguous selected tile, candidates:', candidates.length);
+    return null;
   }
+
+  getTileImage(tile) {
+    return tile ? tile.querySelector(SELECTORS.tileImage) : null;
+  }
+
+  isGenerating(tile) {
+    // While generating, the tile holds a stand-in thumbnail and an "incoming" image
+    if (tile && tile.querySelector(SELECTORS.tileIncoming)) return true;
+    // Also treat the whole canvas as generating if any incoming image exists
+    return document.querySelector(SELECTORS.tileIncoming) !== null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // History items
+  // ---------------------------------------------------------------------------
 
   getHistoryItems() {
-    // Get all history items from the container (no sc-* class dependency)
-    const container = this._findHistoryItemContainer();
-    if (!container) return [];
-
-    return Array.from(container.children);
+    const root = document.querySelector(SELECTORS.historyRoot);
+    if (!root) return [];
+    return Array.from(root.querySelectorAll(SELECTORS.historyItem));
   }
 
-  getSelectedHistoryIndex() {
-    // Find the currently selected history item index
-    // Returns the index if found, -1 otherwise
-    const items = this.getHistoryItems();
-    if (items.length === 0) return -1;
-
-    // Find the selected item by checking border-color
-    // Selected: rgb(245, 243, 194), Non-selected: transparent or rgba(0, 0, 0, 0)
-    for (let i = 0; i < items.length; i++) {
-      const computedStyle = window.getComputedStyle(items[i]);
-      const borderColor = computedStyle.borderColor;
-      const isSelected = borderColor !== 'transparent' &&
-                         borderColor !== 'rgba(0, 0, 0, 0)';
-      if (isSelected) {
-        return i;
-      }
+  // Selected history item has a box-shadow highlight; non-selected items have none
+  getSelectedHistoryItem() {
+    for (const item of this.getHistoryItems()) {
+      const boxShadow = window.getComputedStyle(item).boxShadow;
+      if (boxShadow && boxShadow !== 'none') return item;
     }
-    return -1;
+    return null;
+  }
+
+  // Stable identity of a history item: data-group-id (UUID), bgHash fallback
+  getHistoryKey(item) {
+    if (!item) return null;
+    return item.getAttribute('data-group-id') || this.getBackgroundImageHash(item);
+  }
+
+  getSelectedHistoryKey() {
+    return this.getHistoryKey(this.getSelectedHistoryItem());
   }
 
   getBackgroundImageHash(element) {
@@ -422,38 +361,57 @@ class SoejiUploader {
     return (hash >>> 0).toString(16).padStart(8, '0');
   }
 
-  updateButtonState(button, imgElement) {
-    // Check if image is still being generated (streaming)
-    if (this.isStreamingImage(imgElement)) {
-      button.disabled = true;
-      button.classList.add('soeji-disabled');
-      button.title = 'Image is generating...';
-    } else {
-      button.disabled = false;
-      button.classList.remove('soeji-disabled');
-      button.title = 'Upload to Soeji';
+  // ---------------------------------------------------------------------------
+  // Button state / badges
+  // ---------------------------------------------------------------------------
 
-      // Update uploaded state (check if in history map by bgHash)
-      const selectedIndex = this.getSelectedHistoryIndex();
-      if (selectedIndex >= 0) {
-        const historyItems = this.getHistoryItems();
-        const bgHash = historyItems[selectedIndex]
-          ? this.getBackgroundImageHash(historyItems[selectedIndex])
-          : null;
-        if (bgHash && this.history.has(bgHash)) {
-          button.classList.add('soeji-uploaded');
-        } else {
-          button.classList.remove('soeji-uploaded');
-        }
-      } else {
-        button.classList.remove('soeji-uploaded');
-      }
+  // Keep NAI's styled-components classes on our button in sync with a sibling NAI button.
+  // NAI swaps these classes by state (e.g. dimmed variant while no image is shown), and the
+  // classes copied at injection time may be the dimmed ones.
+  syncButtonClasses(button) {
+    const wrapper = button.closest('.soeji-button-wrapper');
+    const container = wrapper ? wrapper.parentElement : null;
+    if (!container) return;
+
+    const reference = container.querySelector('div[style*="height: 100%"] > button:not(.soeji-upload-btn)');
+    if (!reference) return;
+
+    const naiClasses = reference.className.split(' ').filter(Boolean);
+    const ownClasses = Array.from(button.classList).filter((c) => c.startsWith('soeji-'));
+    const desired = [...naiClasses, ...ownClasses].join(' ');
+    if (button.className !== desired) {
+      button.className = desired;
     }
   }
 
-  updateButtonOpacity(button, imgElement) {
-    // Delegate to updateButtonState for unified handling
-    this.updateButtonState(button, imgElement);
+  updateButtonState() {
+    const button = this.currentButton;
+    if (!button || !button.isConnected) return;
+
+    this.syncButtonClasses(button);
+
+    const tile = this.getSelectedTile();
+    const image = this.getTileImage(tile);
+
+    if (!tile || !image || this.isGenerating(tile)) {
+      button.disabled = true;
+      button.classList.add('soeji-disabled');
+      button.classList.remove('soeji-uploaded');
+      button.title = this.isGenerating(tile) ? 'Image is generating...' : 'No image selected';
+      return;
+    }
+
+    button.disabled = false;
+    button.classList.remove('soeji-disabled');
+    button.title = 'Upload to Soeji';
+
+    // Uploaded state (selected history item is tracked in history Map)
+    const historyKey = this.getSelectedHistoryKey();
+    if (historyKey && this.history.has(historyKey)) {
+      button.classList.add('soeji-uploaded');
+    } else {
+      button.classList.remove('soeji-uploaded');
+    }
   }
 
   updateBadges() {
@@ -510,61 +468,32 @@ class SoejiUploader {
     }
   }
 
-  // Sync history badges with current history Map state
-  // Called whenever history state changes
+  // Sync history badges with current history Map state.
+  // Called whenever history state changes or the history DOM changes.
   syncHistoryBadges() {
-    const historyItems = this.getHistoryItems(); // DOM elements (0 = newest)
-    if (!historyItems || historyItems.length === 0) return;
+    for (const item of this.getHistoryItems()) {
+      const key = this.getHistoryKey(item);
+      const data = key ? this.history.get(key) : null;
+      const desiredState = data && data.status !== 'hidden' ? data.status : null;
 
-    // Build a reverse lookup: index -> data
-    const indexToData = new Map();
-    for (const [bgHash, data] of this.history) {
-      indexToData.set(data.index, { bgHash, ...data });
-    }
-
-    // Clear all existing badges, set data-history-key, and manage delete button state
-    historyItems.forEach((item, index) => {
+      // Only touch the DOM when the badge state actually changes
       const existingBadge = item.querySelector('.soeji-history-badge');
-      if (existingBadge) existingBadge.remove();
+      const existingState = existingBadge ? existingBadge.dataset.state : null;
+      if (existingState !== desiredState) {
+        if (existingBadge) existingBadge.remove();
+        if (desiredState) this.createHistoryBadge(item, desiredState);
+      }
 
-      const data = indexToData.get(index);
-      const deleteBtn = item.querySelector('button[aria-label="delete image(s)"]');
-
-      // Set data-history-key for debugging
-      if (data) {
-        item.setAttribute('data-history-key', data.bgHash);
-
-        // Disable delete button while uploading/pending
-        if (deleteBtn) {
-          const isUploading = data.status === 'uploading' || data.status === 'pending';
+      // Disable delete button while uploading/pending
+      const deleteBtn = item.querySelector(SELECTORS.historyDeleteButton);
+      if (deleteBtn) {
+        const isUploading = !!data && (data.status === 'uploading' || data.status === 'pending');
+        if (deleteBtn.disabled !== isUploading) {
           deleteBtn.disabled = isUploading;
-          if (isUploading) {
-            deleteBtn.style.opacity = '0.3';
-            deleteBtn.style.pointerEvents = 'none';
-          } else {
-            deleteBtn.style.opacity = '';
-            deleteBtn.style.pointerEvents = '';
-          }
-        }
-      } else {
-        item.setAttribute('data-history-key', `(none:${index})`);
-        // Re-enable delete button for items not in history
-        if (deleteBtn) {
-          deleteBtn.disabled = false;
-          deleteBtn.style.opacity = '';
-          deleteBtn.style.pointerEvents = '';
+          deleteBtn.style.opacity = isUploading ? '0.3' : '';
+          deleteBtn.style.pointerEvents = isUploading ? 'none' : '';
         }
       }
-    });
-
-    // For each entry in history Map, create badge at the corresponding DOM index
-    for (const [, data] of this.history) {
-      if (data.status === 'hidden') continue;
-
-      const historyElement = historyItems[data.index];
-      if (!historyElement) continue;
-
-      this.createHistoryBadge(historyElement, data.status);
     }
   }
 
@@ -579,6 +508,7 @@ class SoejiUploader {
     // Create new badge
     const badge = document.createElement('span');
     badge.className = 'soeji-history-badge';
+    badge.dataset.state = state;
 
     if (state === 'uploading' || state === 'pending') {
       badge.classList.add('soeji-history-badge-uploading');
@@ -599,35 +529,31 @@ class SoejiUploader {
   }
 
   // Update history item status and sync badges
-  updateHistoryStatus(bgHash, status, index = null) {
-    // Clear any existing timeout for this bgHash
-    const existingTimeout = this.historyBadgeTimeouts.get(bgHash);
+  updateHistoryStatus(historyKey, status) {
+    // Clear any existing timeout for this key
+    const existingTimeout = this.historyBadgeTimeouts.get(historyKey);
     if (existingTimeout) {
       clearTimeout(existingTimeout);
-      this.historyBadgeTimeouts.delete(bgHash);
+      this.historyBadgeTimeouts.delete(historyKey);
     }
 
-    // Get existing entry to preserve index if not provided
-    const existing = this.history.get(bgHash);
-    const finalIndex = index !== null ? index : (existing ? existing.index : 0);
-
     // Update status in history Map
-    this.history.set(bgHash, { status, index: finalIndex });
+    this.history.set(historyKey, { status });
 
-    // Sync badges
+    // Sync badges and button state
     this.syncHistoryBadges();
+    this.updateButtonState();
 
     // Set auto-hide timeout for success/duplicate
     if (status === 'success' || status === 'duplicate') {
       const timeout = setTimeout(() => {
-        const current = this.history.get(bgHash);
-        if (current) {
-          this.history.set(bgHash, { status: 'hidden', index: current.index });
+        if (this.history.has(historyKey)) {
+          this.history.set(historyKey, { status: 'hidden' });
         }
-        this.historyBadgeTimeouts.delete(bgHash);
+        this.historyBadgeTimeouts.delete(historyKey);
         this.syncHistoryBadges();
       }, 3000);
-      this.historyBadgeTimeouts.set(bgHash, timeout);
+      this.historyBadgeTimeouts.set(historyKey, timeout);
     }
   }
 
@@ -657,43 +583,50 @@ class SoejiUploader {
     }, 3000);
   }
 
-  async handleUpload(imgElement, button) {
-    // Skip streaming images (still being generated)
-    if (this.isStreamingImage(imgElement)) {
-      console.log('[Soeji] Skipping streaming image');
+  // ---------------------------------------------------------------------------
+  // Upload queue
+  // ---------------------------------------------------------------------------
+
+  handleUpload() {
+    // Resolve the currently selected image at click time (the viewer bar is shared by all tiles)
+    const tile = this.getSelectedTile();
+    const image = this.getTileImage(tile);
+    if (!tile || !image) {
+      console.log('[Soeji] No selected image found');
       return;
     }
 
-    const blobUrl = imgElement.src;
+    // Skip images still being generated
+    if (this.isGenerating(tile)) {
+      console.log('[Soeji] Skipping generating image');
+      return;
+    }
 
-    // Get the currently selected history item index and its background-image hash
-    const historyIndex = this.getSelectedHistoryIndex();
-    const historyItems = this.getHistoryItems();
-    const bgHash = historyIndex >= 0 && historyItems[historyIndex]
-      ? this.getBackgroundImageHash(historyItems[historyIndex])
-      : null;
-    console.log('[Soeji] Selected history index:', historyIndex, 'bgHash:', bgHash);
+    const blobUrl = image.currentSrc || image.src;
 
-    // Check if this image is already in the queue (uploading or pending) by bgHash
-    if (bgHash) {
-      const isInQueue = this.uploadQueue.some(item => item.bgHash === bgHash);
+    // Identify the selected history item for state tracking
+    const historyKey = this.getSelectedHistoryKey();
+    console.log('[Soeji] Selected history key:', historyKey);
+
+    // Check if this image is already in the queue (uploading or pending)
+    if (historyKey) {
+      const isInQueue = this.uploadQueue.some(item => item.historyKey === historyKey);
       if (isInQueue) {
-        console.log('[Soeji] Image already in queue (bgHash):', bgHash);
+        console.log('[Soeji] Image already in queue:', historyKey);
         return;
       }
     }
 
-    // Add to history map with pending status and index, update button opacity
-    if (bgHash) {
-      this.updateHistoryStatus(bgHash, 'pending', historyIndex);
+    // Add to history map with pending status
+    if (historyKey) {
+      this.updateHistoryStatus(historyKey, 'pending');
     }
-    this.updateButtonOpacity(button, imgElement);
 
-    // Create queue item with bgHash for history tracking
+    // Create queue item
     const queueItem = {
       id: crypto.randomUUID(),
       blobUrl: blobUrl,
-      bgHash: bgHash,
+      historyKey: historyKey,
       status: 'pending'
     };
 
@@ -727,8 +660,8 @@ class SoejiUploader {
 
   async executeUpload(item) {
     // Update history status to uploading
-    if (item.bgHash) {
-      this.updateHistoryStatus(item.bgHash, 'uploading');
+    if (item.historyKey) {
+      this.updateHistoryStatus(item.historyKey, 'uploading');
     }
 
     try {
@@ -742,21 +675,21 @@ class SoejiUploader {
         if (result.duplicate) {
           item.status = 'duplicate';
           console.log('[Soeji] Duplicate:', item.id);
-          if (item.bgHash) {
-            this.updateHistoryStatus(item.bgHash, 'duplicate');
+          if (item.historyKey) {
+            this.updateHistoryStatus(item.historyKey, 'duplicate');
           }
         } else {
           item.status = 'success';
           console.log('[Soeji] Success:', item.id);
-          if (item.bgHash) {
-            this.updateHistoryStatus(item.bgHash, 'success');
+          if (item.historyKey) {
+            this.updateHistoryStatus(item.historyKey, 'success');
           }
         }
       } else {
         item.status = 'error';
         this.currentBatchHasError = true;
-        if (item.bgHash) {
-          this.updateHistoryStatus(item.bgHash, 'error');
+        if (item.historyKey) {
+          this.updateHistoryStatus(item.historyKey, 'error');
         }
         console.log('[Soeji] Error:', item.id, result.error);
       }
@@ -764,8 +697,8 @@ class SoejiUploader {
       console.error('[Soeji] Upload error:', error);
       item.status = 'error';
       this.currentBatchHasError = true;
-      if (item.bgHash) {
-        this.updateHistoryStatus(item.bgHash, 'error');
+      if (item.historyKey) {
+        this.updateHistoryStatus(item.historyKey, 'error');
       }
     }
 
